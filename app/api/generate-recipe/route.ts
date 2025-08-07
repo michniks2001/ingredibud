@@ -7,11 +7,11 @@ interface FormFields {
     diet: string | undefined,
     include: Array<string> | undefined,
     exclude: Array<string> | undefined,
-    
+
 
 }
 
-const ai = new GoogleGenAI({apiKey: process.env.GEMINI_API_KEY});
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 const groundingTool = {
     googleSearch: {}
@@ -46,7 +46,7 @@ async function resolveVertexRedirect(u: string): Promise<string> {
                             if (typeof Buffer !== "undefined") {
                                 return Buffer.from(padded, "base64").toString("utf8");
                             }
-                        } catch {}
+                        } catch { }
                         try {
                             // atob works with standard base64 (not url-safe); use padded
                             const bin = (globalThis as any).atob ? (globalThis as any).atob(padded) : "";
@@ -110,10 +110,10 @@ async function resolveVertexRedirect(u: string): Promise<string> {
 
 async function resolveCanonicalOrFinal(u: string): Promise<string> {
     const STOP = new Set([
-        'easy','best','quick','simple','classic','authentic','healthy','keto','low','low-carb','gluten','gluten-free','vegan','vegetarian','paleo','dairy-free','spicy','russian','italian','mexican','thai','greek','indian','recipe','recipes',
-        'with','and','or','the','a','an','to','of','on','in'
+        'easy', 'best', 'quick', 'simple', 'classic', 'authentic', 'healthy', 'keto', 'low', 'low-carb', 'gluten', 'gluten-free', 'vegan', 'vegetarian', 'paleo', 'dairy-free', 'spicy', 'russian', 'italian', 'mexican', 'thai', 'greek', 'indian', 'recipe', 'recipes',
+        'with', 'and', 'or', 'the', 'a', 'an', 'to', 'of', 'on', 'in'
     ]);
-    const CORRECT: Record<string,string> = { 'ukranian': 'ukrainian' };
+    const CORRECT: Record<string, string> = { 'ukranian': 'ukrainian' };
     const tokensFromPath = (path: string) => {
         return path
             .toLowerCase()
@@ -138,7 +138,7 @@ async function resolveCanonicalOrFinal(u: string): Promise<string> {
                 const path = new URL(url).pathname;
                 const s = scoreText(path, toks);
                 if (s > bestScore) { bestScore = s; best = url; }
-            } catch {}
+            } catch { }
         }
         return best;
     };
@@ -174,7 +174,7 @@ async function resolveCanonicalOrFinal(u: string): Promise<string> {
             if (/^www\.food\.com$/i.test(url.hostname)) {
                 return await siteSearchFood(toks);
             }
-        } catch {}
+        } catch { }
         return current;
     };
     try {
@@ -198,7 +198,7 @@ async function resolveCanonicalOrFinal(u: string): Promise<string> {
                 const base = new URL(u);
                 const abs = new URL(candidate, base).toString();
                 return normalizeUrl(abs);
-            } catch {/* ignore */}
+            } catch {/* ignore */ }
         }
 
         const toks = tokensFromPath(new URL(u).pathname);
@@ -239,7 +239,7 @@ async function resolveCanonicalOrFinal(u: string): Promise<string> {
                                 const html2 = await get.text();
                                 const c2 = html2.match(/<link[^>]*rel=["']canonical["'][^>]*href=["']([^"']+)["'][^>]*>/i)?.[1];
                                 if (c2) {
-                                    try { return normalizeUrl(new URL(c2, dest2).toString()); } catch {}
+                                    try { return normalizeUrl(new URL(c2, dest2).toString()); } catch { }
                                 }
                                 return normalizeUrl(dest2);
                             }
@@ -355,8 +355,8 @@ Output a friendly recipe with:
             ? result.response.text()
             : (result?.text ?? '');
 
-        const cleaned = await rewriteLinksToDirect(text);
-        return NextResponse.json({ recipe: cleaned });
+        // const cleaned = await rewriteLinksToDirect(text);
+        return NextResponse.json({ recipe: text });
     } catch (err) {
         console.error('generate-recipe error', err);
         return NextResponse.json(
