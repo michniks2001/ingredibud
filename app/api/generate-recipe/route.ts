@@ -16,7 +16,7 @@ async function resolveVertexRedirect(u: string): Promise<string> {
         if (headResp.ok && headResp.url && !/vertexaisearch\.cloud\.google\.com/i.test(headResp.url)) {
             return normalizeUrl(headResp.url);
         }
-    } catch (e) {
+    } catch {
         // Fallback to GET if HEAD fails (some servers don't support it)
         try {
             const getResp = await fetchWithTimeout(u, { method: 'GET', redirect: 'follow' });
@@ -45,6 +45,62 @@ async function rewriteLinksToDirect(input: string): Promise<string> {
         }
     }
     return out;
+}
+
+// Remove any model-emitted URLs so we can inject trusted citations only
+function stripModelUrls(input: string): string {
+    if (!input) return input;
+    // Remove markdown links [text](http...)
+    let s = input.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/gi, "$1");
+    // Remove bare URLs
+    s = s.replace(/https?:\/\/[^\s<)]+/gi, "");
+    return s;
+}
+
+// Minimal types for grounding metadata to avoid using 'any'
+type GroundingChunkWeb = { uri?: string; title?: string };
+type GroundingChunk = { web?: GroundingChunkWeb };
+type GroundingSupport = { groundingChunkIndices?: number[] };
+type GroundingMetadata = { groundingChunks?: GroundingChunk[]; groundingSupports?: GroundingSupport[] };
+type Candidate = { groundingMetadata?: GroundingMetadata };
+type GenerateContentResponseLike = { candidates?: Candidate[]; text?: string };
+
+// Extract grounded URLs (and optional titles) from Google Search grounding metadata
+function extractGroundedSources(response: GenerateContentResponseLike | undefined): { url: string; title?: string }[] {
+    const cand = response?.candidates?.[0];
+    const gm = cand?.groundingMetadata;
+    const chunks: GroundingChunk[] = gm?.groundingChunks || [];
+    const supports: GroundingSupport[] = gm?.groundingSupports || [];
+
+    const indexSet = new Set<number>();
+    for (const s of supports) {
+        const indices: number[] = s?.groundingChunkIndices || [];
+        for (const i of indices) indexSet.add(i);
+    }
+
+    const pickAll = indexSet.size === 0; // fallback if no supports
+    const seen = new Set<string>();
+    const out: { url: string; title?: string }[] = [];
+
+    const addByIndex = (i: number) => {
+        const ch = chunks[i];
+        const uri = ch?.web?.uri as string | undefined;
+        if (!uri) return;
+        const norm = normalizeUrl(uri);
+        if (!/^https?:\/\//i.test(norm)) return;
+        if (seen.has(norm)) return;
+        seen.add(norm);
+        const title = ch?.web?.title as string | undefined;
+        out.push({ url: norm, title });
+    };
+
+    if (pickAll) {
+        for (let i = 0; i < chunks.length; i++) addByIndex(i);
+    } else {
+        for (const i of indexSet) addByIndex(i);
+    }
+
+    return out.slice(0, 3);
 }
 
 
@@ -82,16 +138,37 @@ export async function POST(request: NextRequest) {
             ? `simple easy ${base} recipe${includePhrase}${excludePhrase}`.replace(/\s+/g, " ").trim()
             : "simple beginner-friendly popular easy weeknight recipe";
 
-        const prompt = `Based on a Google search for "${searchQuery}", synthesize ONE clear, concise recipe. Output a friendly recipe with: - Title - Ingredients with amounts - Step-by-step instructions (5–8 steps) - Estimated total time and servings. At the end, list 1–3 source URLs you used as full https:// links.`;
+        const prompt = `Based on a Google Search for "${searchQuery}", synthesize ONE clear, concise recipe.
+Output a friendly recipe with:
+- Title
+- Ingredients with amounts
+- Step-by-step instructions (5–8 steps)
+- Estimated total time and servings.
+
+Important:
+- Do NOT include any URLs or link references in the recipe body.
+- You may reference facts, but leave citations to the system. The server will attach sources from Google Search grounding.`;
 
         const result = await ai.models.generateContent({
             model: "gemini-2.5-pro",
             contents: [{ role: "user", parts: [{ text: prompt }] }],
-            tools: [{ googleSearch: {} }] // Explicitly enable the search tool
+            config: { tools: [{ googleSearch: {} }] } // Enable the Search tool via config
         });
 
-        const text = result.text;
-        const cleanedText = await rewriteLinksToDirect(text);
+        // Get response text (SDK exposes as a property)
+        const rawText: string = result.text || "";
+
+        // Strip any model-emitted URLs (we will append grounded sources only)
+        const bodyNoUrls = stripModelUrls(rawText).trim();
+
+        // Build a Sources section from grounding metadata
+        const sources = extractGroundedSources(result);
+        const sourcesMd = sources.length
+            ? "\n\nSources:\n" + sources.map(s => s.title ? `- [${s.title}](${s.url})` : `- ${s.url}`).join("\n")
+            : "";
+
+        const finalMd = `${bodyNoUrls}${sourcesMd}`;
+        const cleanedText = await rewriteLinksToDirect(finalMd);
 
         return NextResponse.json({ recipe: cleanedText });
 
