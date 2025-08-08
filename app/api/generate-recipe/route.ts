@@ -1,6 +1,10 @@
-import { NextRequest, NextResponse } from "next/server";
+import { NextRequest } from "next/server";
 import { GoogleGenAI } from "@google/genai";
 import { normalizeUrl } from "@/lib/markdown";
+
+// Ensure we use Node runtime for streaming compatibility
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
 // Re-introducing a lightweight URL cleaner
 function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}, timeoutMs = 3000) {
@@ -149,28 +153,51 @@ Important:
 - Do NOT include any URLs or link references in the recipe body.
 - You may reference facts, but leave citations to the system. The server will attach sources from Google Search grounding.`;
 
-        const result = await ai.models.generateContent({
+        // Streamed generation with Google Search grounding enabled
+        const stream = await ai.models.generateContentStream({
             model: "gemini-2.5-pro",
             contents: [{ role: "user", parts: [{ text: prompt }] }],
-            config: { tools: [{ googleSearch: {} }] } // Enable the Search tool via config
+            config: { tools: [{ googleSearch: {} }] }
         });
 
-        // Get response text (SDK exposes as a property)
-        const rawText: string = result.text || "";
+        const encoder = new TextEncoder();
+        let lastResponse: GenerateContentResponseLike | undefined;
 
-        // Strip any model-emitted URLs (we will append grounded sources only)
-        const bodyNoUrls = stripModelUrls(rawText).trim();
+        const readable = new ReadableStream<Uint8Array>({
+            async start(controller) {
+                try {
+                    // Stream the body text as it arrives, stripping any URLs in the body
+                    for await (const chunk of stream as AsyncGenerator<GenerateContentResponseLike>) {
+                        lastResponse = chunk;
+                        const piece = stripModelUrls(chunk?.text || "");
+                        if (piece) controller.enqueue(encoder.encode(piece));
+                    }
 
-        // Build a Sources section from grounding metadata
-        const sources = extractGroundedSources(result);
-        const sourcesMd = sources.length
-            ? "\n\nSources:\n" + sources.map(s => s.title ? `- [${s.title}](${s.url})` : `- ${s.url}`).join("\n")
-            : "";
+                    // Append Sources section from grounding metadata at the end
+                    const sources = extractGroundedSources(lastResponse);
+                    if (sources.length) {
+                        const sourcesMd = "\n\nSources:\n" + sources
+                            .map(s => s.title ? `- [${s.title}](${s.url})` : `- ${s.url}`)
+                            .join("\n");
+                        const cleaned = await rewriteLinksToDirect(sourcesMd);
+                        controller.enqueue(encoder.encode(cleaned));
+                    }
+                } catch {
+                    // Best-effort error note in stream
+                    controller.enqueue(encoder.encode("\n\n[An error occurred while streaming the response.]"));
+                } finally {
+                    controller.close();
+                }
+            }
+        });
 
-        const finalMd = `${bodyNoUrls}${sourcesMd}`;
-        const cleanedText = await rewriteLinksToDirect(finalMd);
-
-        return NextResponse.json({ recipe: cleanedText });
+        return new Response(readable, {
+            headers: {
+                'Content-Type': 'text/markdown; charset=utf-8',
+                'Cache-Control': 'no-cache',
+                'X-Content-Type-Options': 'nosniff'
+            }
+        });
 
     } catch (err: unknown) {
         console.error('generate-recipe error', err);

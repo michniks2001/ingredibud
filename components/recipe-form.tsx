@@ -32,13 +32,28 @@ export default function RecipeForm() {
                 }),
             });
 
-            const data = await res.json();
             if (!res.ok) {
-                throw new Error(data?.error || "Failed to generate recipe");
+                const msg = await res.text().catch(() => "");
+                throw new Error(msg || "Failed to generate recipe");
             }
 
-            const html = markdownToHtml(data?.recipe || "");
-            setRecipeHtml(html);
+            if (!res.body) {
+                throw new Error("No response body received");
+            }
+
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder();
+            let md = "";
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                md += decoder.decode(value, { stream: true });
+                // Progressive render
+                setRecipeHtml(markdownToHtml(md));
+            }
+            // Flush any remaining decoded text
+            md += decoder.decode();
+            setRecipeHtml(markdownToHtml(md));
 
         } catch (err: unknown) {
             if (err instanceof Error) {
