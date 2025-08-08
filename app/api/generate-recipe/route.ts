@@ -133,11 +133,11 @@ Important:
 
                     // Streamed generation with Google Search grounding enabled (start inside stream)
                     const stream = await ai.models.generateContentStream({
-                        model: "gemini-2.5-pro",
+                        model: "gemini-2.5-flash",
                         contents: [{ role: "user", parts: [{ text: prompt }] }],
                         config: {
                             tools: [{ googleSearch: {} }],
-                            maxOutputTokens: 600,
+                            maxOutputTokens: 1000,
                             temperature: 0.6
                         }
                     });
