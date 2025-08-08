@@ -2,54 +2,18 @@ import { NextRequest } from "next/server";
 import { GoogleGenAI } from "@google/genai";
 import { normalizeUrl } from "@/lib/markdown";
 
-// Ensure we use Node runtime for streaming compatibility
-export const runtime = 'nodejs';
+// Use Edge runtime for best streaming behavior on Vercel
+export const runtime = 'edge';
 export const dynamic = 'force-dynamic';
+export const maxDuration = 60;
 
-// Re-introducing a lightweight URL cleaner
-function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}, timeoutMs = 3000) {
-    const controller = new AbortController();
-    const id = setTimeout(() => controller.abort(), timeoutMs);
-    const merged: RequestInit = { ...init, signal: controller.signal };
-    return fetch(input, merged).finally(() => clearTimeout(id));
+// Helper to format text as an SSE data event
+function sseData(text: string): string {
+    const lines = (text || '').split('\n');
+    return lines.map(l => `data: ${l}`).join('\n') + '\n\n';
 }
 
-async function resolveVertexRedirect(u: string): Promise<string> {
-    try {
-        const headResp = await fetchWithTimeout(u, { method: 'HEAD', redirect: 'follow' });
-        if (headResp.ok && headResp.url && !/vertexaisearch\.cloud\.google\.com/i.test(headResp.url)) {
-            return normalizeUrl(headResp.url);
-        }
-    } catch {
-        // Fallback to GET if HEAD fails (some servers don't support it)
-        try {
-            const getResp = await fetchWithTimeout(u, { method: 'GET', redirect: 'follow' });
-            if (getResp.ok && getResp.url && !/vertexaisearch\.cloud\.google\.com/i.test(getResp.url)) {
-                return normalizeUrl(getResp.url);
-            }
-        } catch { /* Suppress errors and return original URL */ }
-    }
-    return u; // Return original URL if resolution fails
-}
-
-async function rewriteLinksToDirect(input: string): Promise<string> {
-    if (!input) return input;
-
-    const vertexRegex = /https?:\/\/vertexaisearch\.cloud\.google\.com\/grounding-api-redirect\/[^\s)\]]+/g;
-    const matches = Array.from(new Set(input.match(vertexRegex) || []));
-    if (matches.length === 0) return input;
-
-    let out = input;
-    const resolutions = await Promise.all(matches.map(async (m) => [m, await resolveVertexRedirect(m)] as const));
-
-    for (const [from, to] of resolutions) {
-        if (to && to !== from) {
-            const safeFrom = from.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            out = out.replace(new RegExp(safeFrom, 'g'), to);
-        }
-    }
-    return out;
-}
+// Removed redirect-resolution helpers in streaming Edge path to avoid extra network latency
 
 // Remove any model-emitted URLs so we can inject trusted citations only
 function stripModelUrls(input: string): string {
@@ -153,39 +117,65 @@ Important:
 - Do NOT include any URLs or link references in the recipe body.
 - You may reference facts, but leave citations to the system. The server will attach sources from Google Search grounding.`;
 
-        // Streamed generation with Google Search grounding enabled
-        const stream = await ai.models.generateContentStream({
-            model: "gemini-2.5-pro",
-            contents: [{ role: "user", parts: [{ text: prompt }] }],
-            config: { tools: [{ googleSearch: {} }] }
-        });
-
         const encoder = new TextEncoder();
         let lastResponse: GenerateContentResponseLike | undefined;
 
+        let keepAlive: ReturnType<typeof setInterval> | undefined;
         const readable = new ReadableStream<Uint8Array>({
             async start(controller) {
                 try {
+                    // Flush headers early and keep alive until first token
+                    controller.enqueue(encoder.encode(': init\n\n'));
+                    let hasFirstChunk = false;
+                    keepAlive = setInterval(() => {
+                        if (!hasFirstChunk) controller.enqueue(encoder.encode(': keep-alive\n\n'));
+                    }, 3000);
+
+                    // Streamed generation with Google Search grounding enabled (start inside stream)
+                    const stream = await ai.models.generateContentStream({
+                        model: "gemini-2.5-pro",
+                        contents: [{ role: "user", parts: [{ text: prompt }] }],
+                        config: {
+                            tools: [{ googleSearch: {} }],
+                            maxOutputTokens: 600,
+                            temperature: 0.6
+                        }
+                    });
+
+                    const startedAt = Date.now();
+                    const deadlineMs = 55000; // end gracefully before platform limit
+
                     // Stream the body text as it arrives, stripping any URLs in the body
+                    let lastWithGM: GenerateContentResponseLike | undefined;
                     for await (const chunk of stream as AsyncGenerator<GenerateContentResponseLike>) {
                         lastResponse = chunk;
+                        if (!hasFirstChunk) { hasFirstChunk = true; clearInterval(keepAlive); }
+                        const gm = chunk?.candidates?.[0]?.groundingMetadata;
+                        if (gm && ((gm.groundingChunks?.length ?? 0) > 0 || (gm.groundingSupports?.length ?? 0) > 0)) {
+                            lastWithGM = chunk;
+                        }
                         const piece = stripModelUrls(chunk?.text || "");
-                        if (piece) controller.enqueue(encoder.encode(piece));
+                        if (piece) controller.enqueue(encoder.encode(sseData(piece)));
+                        if (Date.now() - startedAt > deadlineMs) {
+                            controller.enqueue(encoder.encode(sseData("\n[Ending early due to time limits]\n")));
+                            break;
+                        }
                     }
 
                     // Append Sources section from grounding metadata at the end
-                    const sources = extractGroundedSources(lastResponse);
+                    const sources = extractGroundedSources(lastWithGM || lastResponse);
                     if (sources.length) {
                         const sourcesMd = "\n\nSources:\n" + sources
                             .map(s => s.title ? `- [${s.title}](${s.url})` : `- ${s.url}`)
                             .join("\n");
-                        const cleaned = await rewriteLinksToDirect(sourcesMd);
-                        controller.enqueue(encoder.encode(cleaned));
+                        controller.enqueue(encoder.encode(sseData(sourcesMd)));
                     }
                 } catch {
                     // Best-effort error note in stream
-                    controller.enqueue(encoder.encode("\n\n[An error occurred while streaming the response.]"));
+                    controller.enqueue(encoder.encode(sseData("\n[An error occurred while streaming the response.]\n")));
                 } finally {
+                    // Ensure keep-alive is cleared
+                    if (keepAlive) clearInterval(keepAlive);
                     controller.close();
                 }
             }
@@ -193,8 +183,9 @@ Important:
 
         return new Response(readable, {
             headers: {
-                'Content-Type': 'text/markdown; charset=utf-8',
-                'Cache-Control': 'no-cache',
+                'Content-Type': 'text/event-stream; charset=utf-8',
+                'Cache-Control': 'no-store',
+                'Connection': 'keep-alive',
                 'X-Content-Type-Options': 'nosniff'
             }
         });

@@ -43,17 +43,34 @@ export default function RecipeForm() {
 
             const reader = res.body.getReader();
             const decoder = new TextDecoder();
+            let buffer = "";
             let md = "";
+            const processBuffer = () => {
+                // SSE events are separated by double newlines
+                let idx;
+                while ((idx = buffer.indexOf("\n\n")) !== -1) {
+                    const rawEvent = buffer.slice(0, idx);
+                    buffer = buffer.slice(idx + 2);
+                    const lines = rawEvent.split("\n");
+                    // Ignore comment/keep-alive lines starting with ':'
+                    const dataLines = lines.filter(l => l.startsWith("data: ")).map(l => l.slice(6));
+                    if (dataLines.length) {
+                        const chunk = dataLines.join("\n");
+                        md += chunk;
+                        setRecipeHtml(markdownToHtml(md));
+                    }
+                }
+            };
+
             while (true) {
                 const { value, done } = await reader.read();
                 if (done) break;
-                md += decoder.decode(value, { stream: true });
-                // Progressive render
-                setRecipeHtml(markdownToHtml(md));
+                buffer += decoder.decode(value, { stream: true });
+                processBuffer();
             }
-            // Flush any remaining decoded text
-            md += decoder.decode();
-            setRecipeHtml(markdownToHtml(md));
+            // Flush remaining
+            buffer += decoder.decode();
+            processBuffer();
 
         } catch (err: unknown) {
             if (err instanceof Error) {
